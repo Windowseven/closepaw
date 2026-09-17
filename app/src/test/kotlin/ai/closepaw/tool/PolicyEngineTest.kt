@@ -3,6 +3,7 @@ package ai.closepaw.tool
 import com.google.common.truth.Truth.assertThat
 import ai.closepaw.protocol.AppTier
 import ai.closepaw.protocol.ApprovalMode
+import ai.ruach.action.ActionRisk
 import kotlinx.coroutines.runBlocking
 import org.json.JSONObject
 import org.junit.Test
@@ -337,6 +338,126 @@ class PolicyEngineTest {
 
         val decision = engine.check("mobile_action", clickParams(), "com.bank")
 
+        assertThat(decision).isInstanceOf(PolicyDecision.Deny::class.java)
+    }
+
+    // --- Action-risk layer (M1 Step 6) ---
+
+    @Test
+    fun `critical risk denied even in auto_approve mode`() {
+        val engine = engineWith(mode = ApprovalMode.AUTO_APPROVE)
+        val decision = engine.check(
+            "mobile_action", clickParams(), "com.android.settings",
+            riskLevel = ActionRisk.CRITICAL
+        )
+        assertThat(decision).isInstanceOf(PolicyDecision.Deny::class.java)
+    }
+
+    @Test
+    fun `critical risk denied even on session-allowed package`() {
+        val engine = engineWith()
+        engine.allowPackageForSession("com.android.settings")
+        val decision = engine.check(
+            "mobile_action", clickParams(), "com.android.settings",
+            riskLevel = ActionRisk.CRITICAL
+        )
+        assertThat(decision).isInstanceOf(PolicyDecision.Deny::class.java)
+    }
+
+    @Test
+    fun `high risk asks user even in auto_approve mode`() {
+        val engine = engineWith(mode = ApprovalMode.AUTO_APPROVE)
+        val decision = engine.check(
+            "mobile_action", clickParams(), "com.android.settings",
+            riskLevel = ActionRisk.HIGH
+        )
+        assertThat(decision).isInstanceOf(PolicyDecision.AskUser::class.java)
+        val ask = decision as PolicyDecision.AskUser
+        assertThat(ask.risk).isEqualTo(ActionRisk.HIGH)
+        assertThat(ask.reason).contains("HIGH-risk")
+    }
+
+    @Test
+    fun `high risk is not downgraded by requiresConfirmation false`() {
+        val engine = engineWith(mode = ApprovalMode.AUTO_APPROVE)
+        val decision = engine.check(
+            "mobile_action", clickParams(), "com.android.settings",
+            riskLevel = ActionRisk.HIGH, requiresConfirmation = false
+        )
+        assertThat(decision).isInstanceOf(PolicyDecision.AskUser::class.java)
+    }
+
+    @Test
+    fun `high risk asks regardless of session allow-list`() {
+        val engine = engineWith()
+        engine.allowPackageForSession("com.android.settings")
+        val decision = engine.check(
+            "mobile_action", clickParams(), "com.android.settings",
+            riskLevel = ActionRisk.HIGH
+        )
+        assertThat(decision).isInstanceOf(PolicyDecision.AskUser::class.java)
+    }
+
+    @Test
+    fun `medium risk with requiresConfirmation asks user`() {
+        val engine = engineWith(tiers = mapOf("com.android.settings" to AppTier.NORMAL))
+        val decision = engine.check(
+            "mobile_action", clickParams(), "com.android.settings",
+            riskLevel = ActionRisk.MEDIUM, requiresConfirmation = true
+        )
+        assertThat(decision).isInstanceOf(PolicyDecision.AskUser::class.java)
+        val ask = decision as PolicyDecision.AskUser
+        assertThat(ask.risk).isEqualTo(ActionRisk.MEDIUM)
+    }
+
+    @Test
+    fun `medium risk without confirmation follows app policy`() {
+        val engine = engineWith(tiers = mapOf("com.android.settings" to AppTier.NORMAL))
+        val decision = engine.check(
+            "mobile_action", clickParams(), "com.android.settings",
+            riskLevel = ActionRisk.MEDIUM, requiresConfirmation = false
+        )
+        assertThat(decision).isEqualTo(PolicyDecision.Allow)
+    }
+
+    @Test
+    fun `medium risk on cautious app asks user under smart mode`() {
+        val engine = engineWith()
+        val decision = engine.check(
+            "mobile_action", clickParams(), "com.unknown.app",
+            riskLevel = ActionRisk.MEDIUM
+        )
+        assertThat(decision).isInstanceOf(PolicyDecision.AskUser::class.java)
+    }
+
+    @Test
+    fun `low risk continues through existing policy unchanged`() {
+        val engine = engineWith(mode = ApprovalMode.AUTO_APPROVE)
+        val decision = engine.check(
+            "mobile_action", clickParams(), "com.android.settings",
+            riskLevel = ActionRisk.LOW
+        )
+        assertThat(decision).isEqualTo(PolicyDecision.Allow)
+    }
+
+    @Test
+    fun `escape remains allowed at critical risk`() {
+        val engine = engineWith(tiers = mapOf("com.bank" to AppTier.BLOCKED))
+        val backParams = JSONObject().put("button", "back")
+        val decision = engine.check(
+            "system_button", backParams, "com.bank",
+            riskLevel = ActionRisk.CRITICAL
+        )
+        assertThat(decision).isEqualTo(PolicyDecision.Allow)
+    }
+
+    @Test
+    fun `high risk on blocked app is still denied by app tier`() {
+        val engine = engineWith(tiers = mapOf("com.bank" to AppTier.BLOCKED))
+        val decision = engine.check(
+            "mobile_action", clickParams(), "com.bank",
+            riskLevel = ActionRisk.HIGH
+        )
         assertThat(decision).isInstanceOf(PolicyDecision.Deny::class.java)
     }
 

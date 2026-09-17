@@ -11,6 +11,7 @@ import ai.closepaw.tool.ToolObservation
 import ai.closepaw.tool.ToolSpec
 import ai.closepaw.tool.ValidationResult
 import ai.closepaw.tool.appendReason
+import ai.ruach.action.ActionRisk
 import kotlinx.coroutines.delay
 import org.json.JSONArray
 import org.json.JSONObject
@@ -81,6 +82,12 @@ Launch an app by name. Always use this to open apps — do NOT navigate the app 
 If the target app is already in the foreground, this returns success without relaunching it.
 If the app is not found, suggestions will be provided.
 """.trimIndent()
+
+    // RUACH security metadata (M1): launching an app is a navigation action →
+    // LOW risk, no explicit user confirmation required. Declared explicitly so
+    // the tool contract carries the metadata; PolicyEngine remains authoritative.
+    override val riskLevel: ActionRisk get() = ActionRisk.LOW
+    override val requiresConfirmation: Boolean get() = false
 
     override val parameterSchema: JSONObject by lazy {
         JSONObject().apply {

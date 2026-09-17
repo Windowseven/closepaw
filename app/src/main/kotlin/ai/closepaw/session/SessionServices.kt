@@ -108,6 +108,21 @@ class SessionServices internal constructor(
         val memoryStore: MemoryStore = MemoryStore(java.io.File("")),
         val memoryRecaller: MemoryRecaller = MemoryRecaller(memoryStore)
 ) {
+    /**
+     * Optional RUACH product-layer observer attached per-session (M1 Step 5).
+     *
+     * This is the single seam where the RUACH layer observes the existing ClosePaw
+     * execution loop without becoming a parallel executor: [ai.closepaw.agent
+     * .TurnExecutionPhaseRunner] calls it beside the existing [ai.closepaw.trace
+     * .AgentTrace] writes, and it derives the semantic action observationally from
+     * the existing LLM's own tool calls.
+     *
+     * Attached after session creation (see MainActivity), so the ClosePaw runtime
+     * behaviour is unchanged when RUACH is not present. Nullable so constructor
+     * signatures and existing call sites remain untouched.
+     */
+    @Volatile
+    var executionActionObserver: ai.ruach.integration.ExecutionActionObserver? = null
     companion object {
         private const val TAG = "SessionServices"
         private const val TERMUX_HEALTH_CHECK_TIMEOUT_MS = 2_000L
@@ -374,7 +389,7 @@ class SessionServices internal constructor(
                 userResponseChannel = userResponseChannel,
                 memoryStore = memoryStore,
                 memoryRecaller = memoryRecaller
-        )
+        ).also { it.executionActionObserver = executionActionObserver }
     }
 
     /**

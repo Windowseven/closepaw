@@ -60,6 +60,13 @@ import ai.closepaw.ui.onboarding.OnboardingScreen
 import ai.closepaw.ui.overlay.visualizer.ActionVisualizerManager
 import ai.closepaw.ui.settings.ModelLoadingStatus
 import ai.closepaw.ui.theme.ClosePawTheme
+import ai.ruach.goal.GoalGateway
+import ai.ruach.goal.GoalRequest
+import ai.ruach.goal.GoalSource
+import ai.ruach.goal.GoalSubmitResult
+import ai.ruach.integration.RuachExecutionObserver
+import ai.ruach.trace.ActionTrace
+import ai.ruach.trace.ActionTraceEvent
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -114,6 +121,24 @@ class MainActivity : ComponentActivity() {
     private var pendingEvalTurnBudget: Int? = null
     private var pendingAutoStartGoal: String? = null
     private var pendingGoalRunnable: Runnable? = null
+    private var pendingLaunchPolicy: SessionLaunchPolicy = SessionLaunchPolicy.AUTO
+
+    /**
+     * RUACH product-layer trace for the coordinator's current session (M1 Step 5).
+     * One instance per session — NOT a global singleton. Bound to the same
+     * TraceRecorder the session's AgentTrace uses, and cleared whenever the
+     * coordinator detaches/clears a session.
+     */
+    private var activeActionTrace: ActionTrace? = null
+
+    /**
+     * Entry-boundary gateway (02_ARCHITECTURE.md §19, M1 Step 5). Every new goal
+     * funnels through here — the injected submitter routes it into the existing
+     * ClosePaw pipeline. Rejected goals never reach [launchGoalInSession].
+     */
+    private val goalGateway: GoalGateway by lazy {
+        GoalGateway { request -> launchGoalInSession(request) }
+    }
     private var pendingGoalForConfirmation by mutableStateOf<String?>(null)
     private var intentPayloadConsumed = false
     private lateinit var sessionHistoryManager: SessionHistoryManager
@@ -264,6 +289,7 @@ class MainActivity : ComponentActivity() {
                             sessionHistoryManager.setActiveSessionId(null)
                             sessionHistoryManager.getRecordingService().clearSessionAndAwait()
                             coordinator.detachSession()
+                            activeActionTrace = null
                             Log.d(
                                     TAG,
                                     "History session resumed for viewing; cleared recording state"
@@ -273,6 +299,7 @@ class MainActivity : ComponentActivity() {
                     onNewSession = {
                         coordinator.selectedSessionForReload = null
                         lifecycleScope.launch { coordinator.clearSession() }
+                        activeActionTrace = null
                         viewModel.startNewSession(settingsState.selectedModel, BuildConfig.VERSION_NAME)
                     },
                     onOpenViewer = { openViewer(this@MainActivity) },
@@ -439,6 +466,7 @@ class MainActivity : ComponentActivity() {
 
     private suspend fun clearCurrentSession() {
         coordinator.clearSession()
+        activeActionTrace = null
 
         if (::viewModel.isInitialized) {
             viewModel.clearConversation()
@@ -460,6 +488,7 @@ class MainActivity : ComponentActivity() {
         if (serviceSession.state.value == SessionState.Shutdown) return
 
         coordinator.attachSession(serviceSession)
+        attachRuachTrace(serviceSession, goalRequest = null)
         sessionHistoryManager.setActiveSessionId(serviceSession.sessionId.value)
         val snapshot = serviceSession.getServices().recordingService.getCurrentSession()
         snapshot?.let {
@@ -479,16 +508,61 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
+     * Entry boundary for all new goals (M1 Step 5): routes text through the RUACH
+     * [GoalGateway] so it is normalized and traced (GOAL_RECEIVED) before the
+     * existing ClosePaw pipeline is invoked via the injected submitter.
+     *
+     * A Rejected goal never reaches session submission — the submitter is not called.
+     */
+    private fun startGoal(
+            text: String,
+            source: GoalSource,
+            launchPolicy: SessionLaunchPolicy = SessionLaunchPolicy.AUTO
+    ) {
+        lifecycleScope.launch {
+            pendingLaunchPolicy = launchPolicy
+            try {
+                when (val result = goalGateway.submit(text, source)) {
+                    is GoalSubmitResult.Accepted -> {
+                        // Launch routing happened in the submitter (launchGoalInSession).
+                    }
+                    is GoalSubmitResult.Rejected -> {
+                        pendingAutoStartGoal = null
+                        Toast.makeText(
+                                this@MainActivity,
+                                "Goal rejected: ${result.reason}",
+                                Toast.LENGTH_LONG
+                        ).show()
+                    }
+                }
+            } finally {
+                pendingLaunchPolicy = SessionLaunchPolicy.AUTO
+            }
+        }
+    }
+
+    /**
      * Validate preconditions (permissions, services), then route input through
      * the [SessionCoordinator]: submit to existing session, or create a new one.
      *
      * Input queuing and drain are handled by the coordinator (event-driven,
-     * no timer-loop).
+     * no timer-loop). Used by the chat onSessionNeeded callback and all
+     * intent/retry entry points; every path enters through the RUACH GoalGateway.
      */
     private fun ensureSessionAndSend(
             text: String,
             launchPolicy: SessionLaunchPolicy = SessionLaunchPolicy.AUTO
     ) {
+        startGoal(text, GoalSource.TEXT, launchPolicy)
+    }
+
+    /**
+     * Submitter seam for the [GoalGateway]: runs the existing ClosePaw session /
+     * coordinator path for an accepted goal, preserving the existing preconditions
+     * exactly. Only accepted goals reach this point — rejected goals are handled by
+     * [startGoal] and never touch a session.
+     */
+    private suspend fun launchGoalInSession(request: GoalRequest) {
         if (!validateCloudKeysForSelectedModels()) return
 
         if (!Settings.canDrawOverlays(this)) {
@@ -499,95 +573,124 @@ class MainActivity : ComponentActivity() {
 
         val service = AgentService.instance
         if (service == null) {
-            pendingAutoStartGoal = text
+            pendingAutoStartGoal = request.goal
             Toast.makeText(this, "Please enable the Accessibility Service", Toast.LENGTH_LONG)
                     .show()
             openAccessibilitySettings(this)
             return
         }
 
-        lifecycleScope.launch {
-            // Try existing session first
-            val submitResult = coordinator.submit(text)
-            when (submitResult) {
-                SubmitResult.SENT -> {
-                    pendingAutoStartGoal = null
-                    return@launch
-                }
-                SubmitResult.QUEUED -> return@launch
-                SubmitResult.NO_SESSION, SubmitResult.SESSION_DEAD -> { /* create new session */ }
-            }
+        val launchPolicy = pendingLaunchPolicy
+        val text = request.goal
 
-            // Auto-reload: if session just died and no explicit reload target is set,
-            // recover the dead session's checkpoint so the user keeps context.
-            var autoReload = false
-            if (coordinator.selectedSessionForReload == null
+        // Try existing session first
+        val submitResult = coordinator.submit(text)
+        when (submitResult) {
+            SubmitResult.SENT -> {
+                pendingAutoStartGoal = null
+                recordGoalReceived(request)
+                return
+            }
+            SubmitResult.QUEUED -> {
+                recordGoalReceived(request)
+                return
+            }
+            SubmitResult.NO_SESSION, SubmitResult.SESSION_DEAD -> { /* create new session */ }
+        }
+
+        // Auto-reload: if session just died and no explicit reload target is set,
+        // recover the dead session's checkpoint so the user keeps context.
+        var autoReload = false
+        if (coordinator.selectedSessionForReload == null
                 && launchPolicy != SessionLaunchPolicy.FORCE_FRESH
-            ) {
-                val deadFileName = coordinator.consumeDeadSessionFileName()
-                val deadSessionId = sessionHistoryManager.getCurrentSessionId()
-                if (deadFileName != null && deadSessionId != null) {
-                    coordinator.selectedSessionForReload = SessionInfo(
-                        id = deadSessionId,
-                        fileName = deadFileName,
-                        startTime = 0,
-                        lastUpdated = 0,
-                        messageCount = 0,
-                        displayTitle = "",
-                        firstUserMessage = ""
-                    )
-                    autoReload = true
-                }
+        ) {
+            val deadFileName = coordinator.consumeDeadSessionFileName()
+            val deadSessionId = sessionHistoryManager.getCurrentSessionId()
+            if (deadFileName != null && deadSessionId != null) {
+                coordinator.selectedSessionForReload = SessionInfo(
+                    id = deadSessionId,
+                    fileName = deadFileName,
+                    startTime = 0,
+                    lastUpdated = 0,
+                    messageCount = 0,
+                    displayTitle = "",
+                    firstUserMessage = ""
+                )
+                autoReload = true
             }
+        }
 
-            // Create new session under coordinator's creation lock
-            try {
-                val result = coordinator.createAndSubmit(text) {
-                    createOrReloadSession(service, launchPolicy, autoReload)
+        // Create new session under coordinator's creation lock
+        try {
+            val result = coordinator.createAndSubmit(text) {
+                createOrReloadSession(service, launchPolicy, request, autoReload)
+            }
+            when (result) {
+                ai.closepaw.session.CreateResult.Success -> { /* done */ }
+                ai.closepaw.session.CreateResult.LockBusy -> {
+                    // Another creation in progress — enqueue so input drains
+                    // once the in-flight session becomes Idle/Created.
+                    coordinator.enqueue(text)
+                    recordGoalReceived(request)
                 }
-                when (result) {
-                    ai.closepaw.session.CreateResult.Success -> { /* done */ }
-                    ai.closepaw.session.CreateResult.LockBusy -> {
-                        // Another creation in progress — enqueue so input drains
-                        // once the in-flight session becomes Idle/Created.
-                        coordinator.enqueue(text)
-                    }
-                    ai.closepaw.session.CreateResult.Aborted -> {
-                        // Creation explicitly refused (e.g. non-reloadable checkpoint).
-                        // Coordinator has cleared pendingInputs; do NOT enqueue.
-                    }
+                ai.closepaw.session.CreateResult.Aborted -> {
+                    // Creation explicitly refused (e.g. non-reloadable checkpoint).
+                    // Coordinator has cleared pendingInputs; do NOT enqueue.
                 }
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to create session", e)
-                if (settingsState.llmBackend == LLMBackendType.LOCAL) {
-                    modelLoadingStatusHolder.update(
-                            ModelLoadingStatus.Error(e.message ?: "Unknown error")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to create session", e)
+            if (settingsState.llmBackend == LLMBackendType.LOCAL) {
+                modelLoadingStatusHolder.update(
+                        ModelLoadingStatus.Error(e.message ?: "Unknown error")
+                )
+            }
+            val errMsg = e.message ?: "Unknown error"
+            val deepLink = when (e) {
+                is ai.closepaw.auth.MissingCredential,
+                is ai.closepaw.auth.OAuthRefreshFailed,
+                is ai.closepaw.auth.WrongCredentialType -> {
+                    val provider = (e as? ai.closepaw.auth.MissingCredential)?.provider
+                        ?: (e as? ai.closepaw.auth.OAuthRefreshFailed)?.provider
+                        ?: (e as? ai.closepaw.auth.WrongCredentialType)?.provider
+                    ai.closepaw.ui.chat.SettingsDeepLink(
+                        page = ai.closepaw.ui.chat.SettingsPage.LLM_AUTH,
+                        authTab = provider?.mode,
+                        provider = provider,
                     )
                 }
-                val errMsg = e.message ?: "Unknown error"
-                val deepLink = when (e) {
-                    is ai.closepaw.auth.MissingCredential,
-                    is ai.closepaw.auth.OAuthRefreshFailed,
-                    is ai.closepaw.auth.WrongCredentialType -> {
-                        val provider = (e as? ai.closepaw.auth.MissingCredential)?.provider
-                            ?: (e as? ai.closepaw.auth.OAuthRefreshFailed)?.provider
-                            ?: (e as? ai.closepaw.auth.WrongCredentialType)?.provider
-                        ai.closepaw.ui.chat.SettingsDeepLink(
-                            page = ai.closepaw.ui.chat.SettingsPage.LLM_AUTH,
-                            authTab = provider?.mode,
-                            provider = provider,
-                        )
-                    }
-                    else -> null
-                }
-                viewModel.reportStartupFailure(text, errMsg, deepLink)
-                Toast.makeText(
-                                this@MainActivity,
-                                "Failed to start: $errMsg",
-                                Toast.LENGTH_LONG
-                        )
-                        .show()
+                else -> null
             }
+            viewModel.reportStartupFailure(text, errMsg, deepLink)
+            Toast.makeText(
+                    this@MainActivity,
+                    "Failed to start: $errMsg",
+                    Toast.LENGTH_LONG
+            ).show()
+        }
+    }
+
+    /** Emits GOAL_RECEIVED for an accepted goal on the session's live product trace. */
+    private fun recordGoalReceived(request: GoalRequest) {
+        activeActionTrace?.recordEvent(ActionTraceEvent.GoalReceived(request))
+    }
+
+    /**
+     * Attach the RUACH product trace and execution observer for a session (M1 Step 5).
+     * One [ActionTrace] per session, bound to the session's TraceRecorder, so the
+     * product stages (`goal_received`, `action_created`, `action_completed`) sit on
+     * top of the existing AgentTrace stages. The observer is attached to
+     * SessionServices and therefore invoked by TurnExecutionPhaseRunner during
+     * execution; sessions that never go through this call keep a null observer, so
+     * the ClosePaw runtime is unchanged.
+     */
+    private fun attachRuachTrace(session: AgentSession, goalRequest: GoalRequest?) {
+        val services = session.getServices()
+        val trace = ActionTrace(session.sessionId.value, services.traceRecorder)
+        services.executionActionObserver = RuachExecutionObserver(trace)
+        activeActionTrace = trace
+        if (goalRequest != null) {
+            trace.recordEvent(ActionTraceEvent.GoalReceived(goalRequest))
         }
     }
 
@@ -601,6 +704,7 @@ class MainActivity : ComponentActivity() {
     private suspend fun createOrReloadSession(
             service: AgentService,
             launchPolicy: SessionLaunchPolicy,
+            goalRequest: GoalRequest? = null,
             autoReload: Boolean = false
     ): AgentSession? {
         val baseUrlOverrides: Map<LLMProvider, String> = if (settingsState.openaiBaseUrl.isNotBlank()) {
@@ -648,6 +752,7 @@ class MainActivity : ComponentActivity() {
         sessionHistoryManager.setActiveSessionId(session.sessionId.value)
         viewModel.startEventCollection(session)
         service.observeExternalSession(session, session.getServices().platform.mode)
+        attachRuachTrace(session, goalRequest)
 
         Log.i(TAG, "Session ready with backend=${settingsState.llmBackend} and message sent")
         return session

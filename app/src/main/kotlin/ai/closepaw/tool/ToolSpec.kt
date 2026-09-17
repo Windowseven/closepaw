@@ -1,5 +1,6 @@
 package ai.closepaw.tool
 
+import ai.ruach.action.ActionRisk
 import org.json.JSONObject
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -23,7 +24,31 @@ interface ToolSpec {
     
     /** JSON Schema for the tool's parameters */
     val parameterSchema: JSONObject
-    
+
+    /**
+     * Declared action-risk level of this tool's capability.
+     *
+     * Tool-level security metadata (defaults), NOT the whole authorization
+     * system. It is a declaration for the upcoming action-risk policy
+     * integration; [PolicyEngine] remains authoritative for ALLOW / ASK /
+     * DENY decisions and does not yet consume this field.
+     *
+     * App risk ≠ action risk: the declared risk describes the capability, not
+     * the target application. A single tool may legitimately declare a risk
+     * that differs from what the same app's other tools declare, and tool risk
+     * never automatically equals final action risk.
+     *
+     * Defaults to [ActionRisk.LOW] / confirmation=false so that existing tool
+     * implementations and tests remain backwards-compatible; tools that need
+     * stricter defaults override these properties explicitly.
+     */
+    val riskLevel: ActionRisk
+        get() = ActionRisk.LOW
+
+    /** True when executing this tool should require explicit user authorization. */
+    val requiresConfirmation: Boolean
+        get() = false
+
     /**
      * Validate the parameters before creating an invocation.
      * 

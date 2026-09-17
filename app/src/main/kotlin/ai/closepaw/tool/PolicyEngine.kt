@@ -3,6 +3,7 @@ package ai.closepaw.tool
 import android.util.Log
 import ai.closepaw.protocol.AppTier
 import ai.closepaw.protocol.ApprovalMode
+import ai.ruach.action.ActionRisk
 import org.json.JSONObject
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicReference
@@ -18,9 +19,15 @@ import java.util.concurrent.atomic.AtomicReference
  *  1. Non-screen-changing tool                     → Allow
  *  2. Escape (back/home)                            → Allow
  *  3. effective tier == BLOCKED                     → Deny       (preserves "stricter wins" for open_app)
- *  4. tool == browser_script                        → browser script matrix (NORMAL override does NOT bypass)
- *  5. mode != ALWAYS_ASK && session-allowed         → Allow      (session allow-list, gated by ALWAYS_ASK)
- *  6. ApprovalMode dispatch on the effective tier
+ *  4. action-risk layer (M1 Step 6)                 → CRITICAL = Deny; requiresConfirmation / HIGH = AskUser
+ *  5. tool == browser_script                        → browser script matrix (NORMAL override does NOT bypass)
+ *  6. mode != ALWAYS_ASK && session-allowed         → Allow      (session allow-list, gated by ALWAYS_ASK)
+ *  7. ApprovalMode dispatch on the effective tier
+ *
+ * Action-risk comes from the registered tool definition only (see [ai.closepaw.tool.ToolSpec.riskLevel]),
+ * passed in by [ToolRouter] — never from LLM-supplied arguments. The risk layer is an absolute floor:
+ * CRITICAL is blocked for MVP (no confirmation path may make it executable) and HIGH always requires
+ * explicit user confirmation, regardless of approval mode or session allow-list.
  */
 class PolicyEngine(
     initialApprovalMode: ApprovalMode = ApprovalMode.SMART,
@@ -43,13 +50,20 @@ class PolicyEngine(
      * @param packageName Current foreground app package name
      * @param destinationPackage Target package for navigation tools (e.g. open_app).
      *        When non-null, the effective tier is the stricter of current and destination.
+     * @param riskLevel Declared action risk of the registered tool (M1 Step 6). MUST come from
+     *        the registered [ToolSpec] definition — callers must never derive it from LLM
+     *        arguments, and concrete callers should pass the resolved tool's declaration
+     *        explicitly rather than relying on the LOW default.
+     * @param requiresConfirmation Declared confirmation requirement of the registered tool.
      * @return PolicyDecision indicating how to proceed
      */
     fun check(
         toolName: String,
         params: JSONObject = JSONObject(),
         packageName: String? = null,
-        destinationPackage: String? = null
+        destinationPackage: String? = null,
+        riskLevel: ActionRisk = ActionRisk.LOW,
+        requiresConfirmation: Boolean = false
     ): PolicyDecision {
         val currentMode = approvalMode.get()
         val currentTier = appClassifier.classify(packageName)
@@ -57,7 +71,7 @@ class PolicyEngine(
         // Effective tier = stricter of the two (lower ordinal = stricter)
         val effectiveTier = if (destTier != null) minOf(currentTier, destTier) else currentTier
         val approvalSubject = destinationPackage ?: packageName
-        Log.d(TAG, "Policy check: tool=$toolName, pkg=$packageName, dest=$destinationPackage, tier=$effectiveTier, mode=$currentMode")
+        Log.d(TAG, "Policy check: tool=$toolName, pkg=$packageName, dest=$destinationPackage, tier=$effectiveTier, mode=$currentMode, risk=$riskLevel, confirm=$requiresConfirmation")
 
         val tool = ToolName.from(toolName)
 
@@ -76,20 +90,52 @@ class PolicyEngine(
             return PolicyDecision.Deny("Blocked: financial/auth app ($packageName)")
         }
 
-        // 4. browser_script mutates the user's real Chrome profile through CDP. Chrome is a NORMAL
+        // 4. Action-risk layer (M1 Step 6). The declared risk is loaded from the registered tool
+        //    definition by ToolRouter — never trusted from LLM arguments — so an LLM call cannot
+        //    re-classify a tool's risk. Application-level and action-level policy stay separate:
+        //    this layer gates the *action*, the tier layer above gates the *app*.
+        //    - CRITICAL is an absolute floor for MVP: no approval mode and no user confirmation
+        //      may make it executable within this phase.
+        //    - requiresConfirmation=true always asks, no matter the declared risk (a tool that
+        //      declares it cannot silently run).
+        //    - HIGH always requires explicit confirmation — neither AUTO_APPROVE nor the session
+        //      allow-list can auto-approve it.
+        //    - LOW/MEDIUM continue through the app-tier / mode policy unchanged (a tool cannot
+        //      downgrade its own declared HIGH risk via requiresConfirmation=false).
+        if (riskLevel == ActionRisk.CRITICAL) {
+            Log.w(TAG, "CRITICAL-risk action denied for tool=$toolName")
+            return PolicyDecision.Deny(
+                "Blocked: CRITICAL-risk action is not supported in this phase (${toolName})"
+            )
+        }
+        if (requiresConfirmation || riskLevel == ActionRisk.HIGH) {
+            val reason =
+                if (riskLevel == ActionRisk.HIGH) {
+                    "HIGH-risk action requires explicit confirmation"
+                } else {
+                    "This action requires explicit confirmation"
+                }
+            return PolicyDecision.AskUser(
+                reason = reason,
+                appTier = effectiveTier,
+                risk = riskLevel
+            )
+        }
+
+        // 5. browser_script mutates the user's real Chrome profile through CDP. Chrome is a NORMAL
         //    app, but the browser runtime needs its own SMART-mode approval rule and must not be
         //    bypassed by a NORMAL user override or the session allow-list.
         if (tool == ToolName.BrowserScript) {
             return browserScriptDecision(currentMode, effectiveTier)
         }
 
-        // 5. Session allow-list — capsule "Session" button writes here. Gated by ALWAYS_ASK so
+        // 6. Session allow-list — capsule "Session" button writes here. Gated by ALWAYS_ASK so
         //    the user's "ask me everything" pref always wins over a prior session approval.
         if (currentMode != ApprovalMode.ALWAYS_ASK && isSessionAllowed(approvalSubject)) {
             return PolicyDecision.Allow
         }
 
-        // 6. Apply approval mode using the effective tier. A user NORMAL override on a
+        // 7. Apply approval mode using the effective tier. A user NORMAL override on a
         //    bundled-CAUTIOUS app produces NORMAL here, which SMART auto-approves but
         //    ALWAYS_ASK still asks for. (NORMAL overrides on bundled-BLOCKED are impossible —
         //    refused at write time and pinned by classify().)
@@ -176,6 +222,8 @@ sealed interface PolicyDecision {
     /** Tool call requires user approval */
     data class AskUser(
         val reason: String,
-        val appTier: AppTier? = null
+        val appTier: AppTier? = null,
+        /** Action risk that triggered the approval (M1 Step 6). */
+        val risk: ActionRisk? = null
     ) : PolicyDecision
 }

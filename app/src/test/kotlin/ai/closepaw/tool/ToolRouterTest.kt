@@ -8,6 +8,7 @@ import ai.closepaw.protocol.ApprovalDecision
 import ai.closepaw.protocol.AppTier
 import ai.closepaw.platform.AppInfo
 import ai.closepaw.test.FakeAndroidPlatform
+import ai.ruach.action.ActionRisk
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
@@ -326,6 +327,125 @@ class ToolRouterTest {
         // Now it's cleaned up
         assertThat(router.getActiveCallIds()).isEmpty()
     }
+
+    // === Action-risk layer (M1 Step 6): approval before execution ===
+
+    @Test
+    fun `high risk tool requires approval even in auto_approve mode`() = runTest {
+        val registry = ToolRegistry().apply {
+            register(RiskAwareToolSpec(riskLevel = ActionRisk.HIGH))
+        }
+        val router = ToolRouter(registry, PolicyEngine(ApprovalMode.AUTO_APPROVE, defaultClassifier()))
+        val context = SimpleToolRouterContext(FakeAndroidPlatform())
+        var approvalRequested = false
+
+        val result = router.execute(
+            toolName = "risk_tool",
+            // LLM attempts to self-classify the call as LOW — must be ignored by policy,
+            // which reads the registered tool's declared risk only.
+            params = JSONObject().put("risk_level", "LOW"),
+            context = context,
+            packageName = "com.example.fake",
+            onApprovalRequired = {
+                approvalRequested = true
+                router.resolveApproval(it.callId, ApprovalDecision.APPROVED)
+            }
+        )
+
+        assertThat(approvalRequested).isTrue()
+        assertThat(result).isInstanceOf(ToolCallResult.Success::class.java)
+    }
+
+    @Test
+    fun `high risk user denial prevents execution`() = runTest {
+        var executed = false
+        val registry = ToolRegistry().apply {
+            register(RiskAwareToolSpec(riskLevel = ActionRisk.HIGH) { executed = true })
+        }
+        val router = ToolRouter(registry, PolicyEngine(ApprovalMode.AUTO_APPROVE, defaultClassifier()))
+        val context = SimpleToolRouterContext(FakeAndroidPlatform())
+
+        val result = router.execute(
+            toolName = "risk_tool",
+            params = JSONObject(),
+            context = context,
+            packageName = "com.example.fake",
+            onApprovalRequired = { router.resolveApproval(it.callId, ApprovalDecision.DENIED) }
+        )
+
+        assertThat(result).isInstanceOf(ToolCallResult.Cancelled::class.java)
+        assertThat((result as ToolCallResult.Cancelled).reason).isEqualTo("User denied")
+        assertThat(executed).isFalse()
+    }
+
+    @Test
+    fun `critical risk tool never executes in auto_approve mode`() = runTest {
+        var executed = false
+        val registry = ToolRegistry().apply {
+            register(RiskAwareToolSpec(riskLevel = ActionRisk.CRITICAL) { executed = true })
+        }
+        val router = ToolRouter(registry, PolicyEngine(ApprovalMode.AUTO_APPROVE, defaultClassifier()))
+        val context = SimpleToolRouterContext(FakeAndroidPlatform())
+
+        val result = router.execute(
+            toolName = "risk_tool",
+            params = JSONObject(),
+            context = context,
+            packageName = "com.example.fake"
+        )
+
+        assertThat(result).isInstanceOf(ToolCallResult.Cancelled::class.java)
+        assertThat((result as ToolCallResult.Cancelled).reason).contains("Policy denied")
+        assertThat(executed).isFalse()
+        assertThat(router.hasPendingApprovals()).isFalse()
+        assertThat(router.getActiveCallIds()).isEmpty()
+    }
+
+    @Test
+    fun `medium risk without confirmation executes under auto_approve`() = runTest {
+        var executed = false
+        val registry = ToolRegistry().apply {
+            register(RiskAwareToolSpec(riskLevel = ActionRisk.MEDIUM) { executed = true })
+        }
+        val router = ToolRouter(registry, PolicyEngine(ApprovalMode.AUTO_APPROVE, defaultClassifier()))
+        val context = SimpleToolRouterContext(FakeAndroidPlatform())
+
+        val result = router.execute("risk_tool", JSONObject(), context)
+
+        assertThat(result).isInstanceOf(ToolCallResult.Success::class.java)
+        assertThat(executed).isTrue()
+    }
+
+    @Test
+    fun `medium risk with confirmation requires approval and denial blocks execution`() = runTest {
+        var executed = false
+        val registry = ToolRegistry().apply {
+            register(
+                RiskAwareToolSpec(
+                    riskLevel = ActionRisk.MEDIUM,
+                    requiresConfirmation = true
+                ) { executed = true }
+            )
+        }
+        val router = ToolRouter(registry, PolicyEngine(ApprovalMode.AUTO_APPROVE, defaultClassifier()))
+        val context = SimpleToolRouterContext(FakeAndroidPlatform())
+        var approvalRequested = false
+
+        val result = router.execute(
+            toolName = "risk_tool",
+            params = JSONObject(),
+            context = context,
+            packageName = "com.example.fake",
+            onApprovalRequired = {
+                approvalRequested = true
+                router.resolveApproval(it.callId, ApprovalDecision.DENIED)
+            }
+        )
+
+        assertThat(approvalRequested).isTrue()
+        assertThat(result).isInstanceOf(ToolCallResult.Cancelled::class.java)
+        assertThat(executed).isFalse()
+    }
 }
 
 private class TestToolSpec(
@@ -411,6 +531,43 @@ private class CancellableToolSpec : ToolSpec {
                     delay(100)
                 }
                 return ToolExecutionResult.Cancelled("Cancelled via token")
+            }
+        }
+    }
+}
+
+/**
+ * Tool with an explicit action-risk declaration (M1 Step 6). `onExecuted` records whether the
+ * invocation actually ran, letting tests assert that denials / rejections prevent execution.
+ * Uses an unknown tool name ("risk_tool") which ToolName treats as screen-changing, so the call
+ * reaches the action-risk layer rather than being short-circuited as non-screen-changing.
+ */
+private class RiskAwareToolSpec(
+    override val name: String = "risk_tool",
+    override val riskLevel: ActionRisk = ActionRisk.LOW,
+    override val requiresConfirmation: Boolean = false,
+    private val onExecuted: () -> Unit = {}
+) : ToolSpec {
+    override val description: String = "Risk-aware tool"
+    override val parameterSchema: JSONObject = JSONObject().apply {
+        put("type", "object")
+        put("properties", JSONObject())
+        put("required", JSONArray())
+        put("additionalProperties", false)
+    }
+
+    override fun validate(params: JSONObject): ValidationResult = ValidationResult.Valid
+
+    override fun createInvocation(params: JSONObject): ToolInvocation {
+        return object : ToolInvocation {
+            override val toolName: String = name
+            override val params: JSONObject = params
+
+            override fun getDescription(): String = "Risk-aware tool invocation"
+
+            override suspend fun execute(context: ToolExecutionContext): ToolExecutionResult {
+                onExecuted()
+                return ToolExecutionResult.Success("ok")
             }
         }
     }

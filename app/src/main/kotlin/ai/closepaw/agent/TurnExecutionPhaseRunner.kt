@@ -91,6 +91,10 @@ internal class TurnExecutionPhaseRunner(
         ): SingleToolCallResult {
                 Log.d(TAG, "Executing tool: ${toolCall.name} with args: ${toolCall.arguments}")
                 trace.toolCall(turnId, turnNumber, toolCall)
+                // RUACH product-layer observation seam (M1 Step 5): the observer derives
+                // the SemanticAction observationally from the existing LLM's tool call and
+                // records the semantic stage on top of the lower-level ClosePaw trace.
+                services.executionActionObserver?.onActionCreated(turnId, turnNumber, toolCall)
 
                 eventDispatcher.actionProposed(
                         toolCall.id,
@@ -158,6 +162,14 @@ internal class TurnExecutionPhaseRunner(
                         formattedResult = formatted,
                         observation = observation,
                         observedSnapshot = observedSnapshot
+                )
+
+                services.executionActionObserver?.onActionCompleted(
+                        turnId = turnId,
+                        turnNumber = turnNumber,
+                        toolCall = toolCall,
+                        toolResult = toolResult,
+                        platform = services.platform
                 )
 
                 val outcome = toolResult.toActionOutcome()

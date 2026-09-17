@@ -110,7 +110,18 @@ class ToolRouter(
             resolveOpenAppDestination(params, context.platform)
         } else null
         val approvalPackageName = destinationPackage ?: packageName
-        val policyDecision = policyEngine.check(toolName, params, packageName, destinationPackage)
+        // M1 Step 6: the risk/confirmation declaration is read from the *registered* ToolSpec
+        // definition only. LLM-supplied arguments are never used to classify risk, so an LLM
+        // call cannot downgrade a tool's declared risk or bypass a confirmation requirement.
+        val policyDecision =
+            policyEngine.check(
+                toolName = toolName,
+                params = params,
+                packageName = packageName,
+                destinationPackage = destinationPackage,
+                riskLevel = tool.riskLevel,
+                requiresConfirmation = tool.requiresConfirmation
+            )
         Log.d(TAG, "Policy decision for $toolName: $policyDecision")
         
         when (policyDecision) {

@@ -158,7 +158,83 @@ class TurnExecutionPhaseRunnerTest {
         assertThat(capture.turnId).isEqualTo("t-1")
         assertThat(capture.turnNumber).isEqualTo(3)
     }
+
+    @Test
+    fun `execution observer is notified when attached (open_app seam)`() = runTest {
+        val platform = FakePlatform()
+        val observer = CapturingObserver()
+        val tool = StubTool(
+            name = "open_app",
+            result = ToolExecutionResult.Success(output = "launched")
+        )
+        val harness = TestHarness.build(platform, listOf(tool))
+        harness.services.executionActionObserver = observer
+        val toolCall = ToolCallRequest("call-1", "open_app", JSONObject().put("app_name", "youtube"))
+
+        harness.runner.executeActions(
+            turnId = "t-1",
+            turnNumber = 0,
+            initialSnapshot = ScreenSnapshot(timestamp = 0L, elements = emptyList()),
+            toolCallsToExecute = listOf(toolCall)
+        )
+
+        assertThat(observer.created).hasSize(1)
+        assertThat(observer.created.single().third.id).isEqualTo("call-1")
+        assertThat(observer.created.single().third.name).isEqualTo("open_app")
+
+        assertThat(observer.completed).hasSize(1)
+        val completed = observer.completed.single()
+        assertThat(completed.toolCall.id).isEqualTo("call-1")
+        assertThat(completed.toolResult).isInstanceOf(ToolCallResult.Success::class.java)
+        assertThat(completed.platform).isSameInstanceAs(platform)
+    }
+
+    @Test
+    fun `null observer keeps execution behaviour unchanged`() = runTest {
+        val platform = FakePlatform()
+        val tool = StubTool(name = "stub_tool", result = ToolExecutionResult.Success(output = "ran-ok"))
+        val harness = TestHarness.build(platform, listOf(tool))
+
+        val result = harness.runner.executeActions(
+            turnId = "t-1",
+            turnNumber = 0,
+            initialSnapshot = ScreenSnapshot(timestamp = 0L, elements = emptyList()),
+            toolCallsToExecute = listOf(ToolCallRequest("call-1", tool.name, JSONObject()))
+        )
+
+        assertThat(result.executedToolIds).containsExactly("call-1")
+        assertThat(harness.services.executionActionObserver).isNull()
+    }
 }
+
+// === RUACH observer spy (M1 step 5 seam test) ===
+
+private class CapturingObserver : ai.ruach.integration.ExecutionActionObserver {
+    val created = mutableListOf<Triple<String, Int, ToolCallRequest>>()
+    val completed = mutableListOf<ObservedCompletion>()
+
+    override suspend fun onActionCreated(turnId: String, turnNumber: Int, toolCall: ToolCallRequest) {
+        created += Triple(turnId, turnNumber, toolCall)
+    }
+
+    override suspend fun onActionCompleted(
+        turnId: String,
+        turnNumber: Int,
+        toolCall: ToolCallRequest,
+        toolResult: ToolCallResult,
+        platform: AndroidPlatform,
+    ) {
+        completed += ObservedCompletion(turnId, turnNumber, toolCall, toolResult, platform)
+    }
+}
+
+private data class ObservedCompletion(
+    val turnId: String,
+    val turnNumber: Int,
+    val toolCall: ToolCallRequest,
+    val toolResult: ToolCallResult,
+    val platform: AndroidPlatform,
+)
 
 // === Test harness ===
 
